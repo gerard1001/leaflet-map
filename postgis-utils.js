@@ -133,4 +133,88 @@ const extractPointCoords = (geom) => {
   return null;
 };
 
-module.exports = { fetchGeoJSON, extractPointCoords };
+const radiusFilter = async (table, geomField, latField, lngField, rows, refLat, refLng, radiusKm) => {
+  if (!rows.length) return rows;
+  const pk = table.pk_name || "id";
+  const radiusM = radiusKm * 1000;
+
+  if (geomField) {
+    try {
+      const ids = rows.map((r) => r[pk]);
+      const placeholders = ids.map((_, i) => `$${i + 1}`).join(", ");
+      const res = await db.query(
+        `SELECT "${pk}" FROM "${table.name}"
+         WHERE "${pk}" IN (${placeholders})
+           AND ST_DWithin(
+             "${geomField}"::geography,
+             ST_SetSRID(ST_MakePoint($${ids.length + 1}, $${ids.length + 2}), 4326)::geography,
+             $${ids.length + 3}
+           )`,
+        [...ids, refLng, refLat, radiusM],
+      );
+      const kept = new Set(res.rows.map((r) => r[pk]));
+      return rows.filter((r) => kept.has(r[pk]));
+    } catch (e) {
+      console.error("radiusFilter ST_DWithin error:", e.message);
+      return rows;
+    }
+  }
+
+  if (latField && lngField) {
+    const dLat = radiusKm / 111.32;
+    const dLng = radiusKm / (111.32 * Math.cos((refLat * Math.PI) / 180));
+    return rows.filter((row) => {
+      const lat = parseFloat(row[latField]);
+      const lng = parseFloat(row[lngField]);
+      return (
+        !isNaN(lat) && !isNaN(lng) &&
+        lat >= refLat - dLat && lat <= refLat + dLat &&
+        lng >= refLng - dLng && lng <= refLng + dLng
+      );
+    });
+  }
+
+  return rows;
+};
+
+const bboxFilter = async (table, geomField, latField, lngField, rows, swLat, swLng, neLat, neLng) => {
+  if (!rows.length) return rows;
+  const pk = table.pk_name || "id";
+
+  if (geomField) {
+    try {
+      const ids = rows.map((r) => r[pk]);
+      const placeholders = ids.map((_, i) => `$${i + 1}`).join(", ");
+      const res = await db.query(
+        `SELECT "${pk}" FROM "${table.name}"
+         WHERE "${pk}" IN (${placeholders})
+           AND ST_Intersects(
+             "${geomField}"::geometry,
+             ST_MakeEnvelope($${ids.length + 1}, $${ids.length + 2}, $${ids.length + 3}, $${ids.length + 4}, 4326)
+           )`,
+        [...ids, swLng, swLat, neLng, neLat],
+      );
+      const kept = new Set(res.rows.map((r) => r[pk]));
+      return rows.filter((r) => kept.has(r[pk]));
+    } catch (e) {
+      console.error("bboxFilter ST_Intersects error:", e.message);
+      return rows;
+    }
+  }
+
+  if (latField && lngField) {
+    return rows.filter((row) => {
+      const lat = parseFloat(row[latField]);
+      const lng = parseFloat(row[lngField]);
+      return (
+        !isNaN(lat) && !isNaN(lng) &&
+        lat >= swLat && lat <= neLat &&
+        lng >= swLng && lng <= neLng
+      );
+    });
+  }
+
+  return rows;
+};
+
+module.exports = { fetchGeoJSON, extractPointCoords, radiusFilter, bboxFilter };

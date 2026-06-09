@@ -5,8 +5,7 @@ const Table = require("@saltcorn/data/models/table");
 const Form = require("@saltcorn/data/models/form");
 const Field = require("@saltcorn/data/models/field");
 const { stateFieldsToWhere } = require("@saltcorn/data/plugin-helper");
-const { mergeConnectedObjects } = require("@saltcorn/data/utils");
-const { fetchGeoJSON } = require("./postgis-utils");
+const { fetchGeoJSON, radiusFilter, bboxFilter } = require("./postgis-utils");
 
 const isNode = typeof window === "undefined";
 
@@ -42,9 +41,7 @@ const configuration_workflow = () =>
                 sublabel:
                   "Optional: any field containing geometry (PostGIS column or WKT text). Supports Point, LineString, Polygon and Multi variants.",
                 required: false,
-                attributes: {
-                  options: fields.map((f) => f.name).join(),
-                },
+                attributes: { options: fields.map((f) => f.name).join() },
               },
               {
                 name: "latitude_field",
@@ -109,6 +106,29 @@ const configuration_workflow = () =>
                 label: "Max rows per page",
                 type: "Integer",
               },
+              {
+                name: "enable_radius_filter",
+                label: "Enable 'Near me' filter",
+                type: "Bool",
+                sublabel:
+                  "Adds a 'Near me' button that filters markers within a chosen radius of the user's location and zooms the map to that area.",
+              },
+              {
+                name: "default_radius_km",
+                label: "Default radius (km)",
+                type: "Float",
+                sublabel: "Starting radius shown in the Near me input.",
+                default: 10,
+                showIf: { enable_radius_filter: true },
+              },
+              {
+                name: "enable_viewport_filter",
+                label: "Enable zoom toggle",
+                type: "Bool",
+                sublabel:
+                  "Adds 'Zoom out' / 'Zoom to radius' buttons to switch between the circle view and a fitted view of the filtered markers. Only visible while Near me is active.",
+                showIf: { enable_radius_filter: true },
+              },
             ],
             validator: (values) => {
               if (
@@ -163,6 +183,10 @@ const get_state_fields = async (table_id) => {
       sf.required = false;
       return sf;
     }),
+    { name: "_geo_lat", type: "String", required: false },
+    { name: "_geo_lng", type: "String", required: false },
+    { name: "_geo_radius_km", type: "String", required: false },
+    { name: "_bbox", type: "String", required: false },
   ];
 };
 
@@ -197,14 +221,19 @@ const mkPoints = async (
   } else {
     const rows = queriesObj?.get_rows_query
       ? await queriesObj.get_rows_query(state, table_id)
-      : await getRowsQueryImpl(state, table_id);
+      : await getRowsQueryImpl(
+          state,
+          table_id,
+          null,
+          latitudeField,
+          longitudeField,
+        );
     return rows.map((row) => [
       [row[latitudeField], row[longitudeField], icon ? row[icon] : undefined],
     ]);
   }
 };
 
-// Returns GeoJSON Feature objects for PostGIS geometry-based rendering.
 const mkFeatures = async (
   geomField,
   popupView,
@@ -232,7 +261,7 @@ const mkFeatures = async (
   } else {
     rows = queriesObj?.get_rows_query
       ? await queriesObj.get_rows_query(state, table_id)
-      : await getRowsQueryImpl(state, table_id);
+      : await getRowsQueryImpl(state, table_id, geomField, null, null);
   }
 
   if (rows.length === 0) return [];
@@ -267,10 +296,6 @@ const addOtherPoints = async (
   state,
   queriesObj,
 ) => {
-  console.log(
-    "**************** addOtherPoints",
-    otherMaps.map((m) => m.name),
-  );
   for (const otherMap of otherMaps) {
     const {
       latitude_field,
@@ -281,18 +306,6 @@ const addOtherPoints = async (
       icon,
     } = otherMap.configuration;
     if (postgis_geometry_field) {
-      console.log(
-        await mkFeatures(
-          postgis_geometry_field,
-          popup_view,
-          otherMap.table_id,
-          { ...extraArgs },
-          state,
-          queriesObj,
-          rows_per_page,
-          icon,
-        ),
-      );
       features.push(
         ...(await mkFeatures(
           postgis_geometry_field,
@@ -375,6 +388,9 @@ const run = async (
     height,
     popup_width,
     rows_per_page,
+    enable_radius_filter,
+    default_radius_km,
+    enable_viewport_filter,
     ...rest
   },
   state,
@@ -382,27 +398,10 @@ const run = async (
   queriesObj,
 ) => {
   const id = `map${Math.round(Math.random() * 100000)}`;
-  const points = []; // [[lat,lng,icon?], html?] rendered as L.marker
-  const features = []; // GeoJSON Feature objects rendered as L.geoJSON
+  const points = [];
+  const features = [];
 
   if (postgis_geometry_field) {
-    console.log(
-      "######",
-      JSON.stringify(
-        await mkFeatures(
-          postgis_geometry_field,
-          popup_view,
-          table_id,
-          { ...extraArgs },
-          state,
-          queriesObj,
-          rows_per_page,
-          icon,
-        ),
-        null,
-        2,
-      ),
-    );
     features.push(
       ...(await mkFeatures(
         postgis_geometry_field,
@@ -450,6 +449,105 @@ const run = async (
   const iconJs = (iconVal) =>
     `{icon: L.icon({iconUrl:'/files/serve/${iconVal}',iconSize:[56,60],iconAnchor:[40,59],popupAnchor:[0,0]})}`;
 
+  const activeGeoLat = state._geo_lat ? parseFloat(state._geo_lat) : null;
+  const activeGeoLng = state._geo_lng ? parseFloat(state._geo_lng) : null;
+  const activeRadius = parseFloat(
+    state._geo_radius_km || default_radius_km || 10,
+  );
+  const hasActiveRadius = activeGeoLat !== null && activeGeoLng !== null;
+
+  let controlsJs = "";
+
+  if (enable_radius_filter) {
+    controlsJs += /*js*/ `
+var _NearMeCtrl = L.Control.extend({
+  onAdd: function(map) {
+    var el = L.DomUtil.create('div');
+    el.style.cssText='background:white;padding:4px 6px;border-radius:4px;box-shadow:0 1px 5px rgba(0,0,0,0.4);display:flex;align-items:center;gap:4px;';
+    var inp = L.DomUtil.create('input','',el);
+    inp.type='number'; inp.min=0.1; inp.step=0.1;
+    inp.value=${JSON.stringify(hasActiveRadius ? activeRadius : default_radius_km || 10)};
+    inp.title='Radius (km)';
+    inp.style.cssText='width:52px;font-size:12px;';
+    var lbl = L.DomUtil.create('span','',el);
+    lbl.textContent='km'; lbl.style.fontSize='12px';
+    var btn = L.DomUtil.create('button','',el);
+    btn.textContent='\u{1F4CD} Near me';
+    btn.style.cssText='font-size:12px;padding:2px 6px;cursor:pointer;white-space:nowrap;';
+    L.DomEvent.on(btn,'click',function(e){
+      L.DomEvent.stopPropagation(e);
+      if(!navigator.geolocation){alert('Geolocation not supported');return;}
+      navigator.geolocation.getCurrentPosition(function(pos){
+        var p=new URLSearchParams(window.location.search);
+        p.set('_geo_lat',pos.coords.latitude);
+        p.set('_geo_lng',pos.coords.longitude);
+        p.set('_geo_radius_km',inp.value);
+        p.delete('_bbox');
+        window.location.href=window.location.pathname+'?'+p.toString();
+      },function(err){alert('Location error: '+err.message);});
+    });
+    ${
+      hasActiveRadius
+        ? /*js*/ `
+    var clr = L.DomUtil.create('button','',el);
+    clr.textContent='✕'; clr.title='Clear radius filter';
+    clr.style.cssText='font-size:12px;padding:2px 5px;cursor:pointer;color:#c00;';
+    L.DomEvent.on(clr,'click',function(e){
+      L.DomEvent.stopPropagation(e);
+      var p=new URLSearchParams(window.location.search);
+      p.delete('_geo_lat'); p.delete('_geo_lng'); p.delete('_geo_radius_km');
+      window.location.href=window.location.pathname+'?'+p.toString();
+    });
+    `
+        : ""
+    }
+    L.DomEvent.disableClickPropagation(el);
+    return el;
+  }
+});
+new _NearMeCtrl({position:'topleft'}).addTo(map);
+${
+  hasActiveRadius
+    ? `
+var _geoCircle=L.circle([${activeGeoLat},${activeGeoLng}],{
+  radius:${activeRadius * 1000},color:'#3388ff',fillColor:'#3388ff',
+  fillOpacity:0.05,dashArray:'6,6',weight:2
+}).addTo(map);
+var _origBounds=_bounds.isValid()?_bounds:null;
+map.fitBounds(_geoCircle.getBounds());
+`
+    : ""
+}`;
+  }
+
+  if (enable_viewport_filter && hasActiveRadius) {
+    controlsJs += /*js*/ `
+var _ViewportCtrl = L.Control.extend({
+  onAdd: function(map) {
+    var el = L.DomUtil.create('div');
+    el.style.cssText='background:white;padding:4px 6px;border-radius:4px;box-shadow:0 1px 5px rgba(0,0,0,0.4);display:flex;align-items:center;gap:4px;';
+    var btn = L.DomUtil.create('button','',el);
+    btn.textContent='Zoom out';
+    btn.style.cssText='font-size:12px;padding:2px 6px;cursor:pointer;white-space:nowrap;';
+    var _atCircle=true;
+    L.DomEvent.on(btn,'click',function(e){
+      L.DomEvent.stopPropagation(e);
+      if(_atCircle){
+        if(_origBounds){map.fitBounds(_origBounds);}else{map.fitWorld();}
+        btn.textContent='Zoom to radius';
+      } else {
+        map.fitBounds(_geoCircle.getBounds());
+        btn.textContent='Zoom out';
+      }
+      _atCircle=!_atCircle;
+    });
+    L.DomEvent.disableClickPropagation(el);
+    return el;
+  }
+});
+new _ViewportCtrl({position:'topleft'}).addTo(map);`;
+  }
+
   return (
     div({ id, style: `height:${height}px;` }) +
     script(
@@ -461,7 +559,6 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 
 var _bounds = L.latLngBounds();
 
-// ── Lat/lng markers ──
 var _points = ${JSON.stringify(points)};
 _points.filter(pt=>typeof pt[0][0]==="number").forEach(pt=>{
   L.marker(pt[0], pt[0][2] ? ${iconJs("'+pt[0][2]+'")} : {}).addTo(map)
@@ -471,7 +568,6 @@ _points.filter(pt=>typeof pt[0][0]==="number").forEach(pt=>{
   _bounds.extend([pt[0][0], pt[0][1]]);
 });
 
-// ── PostGIS geometry layer ──
 var _features = ${JSON.stringify(features)};
 if (_features.length) {
   var _geojson = L.geoJSON({type:"FeatureCollection",features:_features}, {
@@ -492,7 +588,7 @@ if (_features.length) {
 }
 
 if (_bounds.isValid()) map.fitBounds(_bounds);
-
+${controlsJs}
 let prevVisibility=false;
 let observer=new IntersectionObserver(()=>{
   const nowVisibile=$("#${id}").is(":visible");
@@ -504,8 +600,6 @@ observer.observe(document.querySelector("#${id}"));
     )
   );
 };
-
-// ── renderRows (single-row map used in Show views) ────────────────────────────
 
 const renderRows = async (
   _table,
@@ -566,13 +660,46 @@ points.forEach(pt=>{ L.marker(pt[0]).addTo(map); });
   }
 };
 
-// ── Misc ──────────────────────────────────────────────────────────────────────
-
-const getRowsQueryImpl = async (state, table_id) => {
+const getRowsQueryImpl = async (
+  state,
+  table_id,
+  geomField,
+  latField,
+  lngField,
+) => {
   const tbl = await Table.findOne({ id: table_id });
   const fields = await tbl.getFields();
-  const qstate = await stateFieldsToWhere({ fields, state });
-  return await tbl.getRows(qstate);
+  const { _geo_lat, _geo_lng, _geo_radius_km, _bbox, ...regularState } = state;
+  const qstate = await stateFieldsToWhere({ fields, state: regularState });
+  let rows = await tbl.getRows(qstate);
+
+  if (_geo_lat && _geo_lng) {
+    rows = await radiusFilter(
+      tbl,
+      geomField,
+      latField,
+      lngField,
+      rows,
+      parseFloat(_geo_lat),
+      parseFloat(_geo_lng),
+      parseFloat(_geo_radius_km || 10),
+    );
+  }
+  if (_bbox) {
+    const [swLat, swLng, neLat, neLng] = _bbox.split(",").map(Number);
+    rows = await bboxFilter(
+      tbl,
+      geomField,
+      latField,
+      lngField,
+      rows,
+      swLat,
+      swLng,
+      neLat,
+      neLng,
+    );
+  }
+  return rows;
 };
 
 const connectedObjects = async ({ viewname, popup_view, ...rest } = {}) => {
@@ -608,9 +735,15 @@ module.exports = {
   get_state_fields,
   configuration_workflow,
   run,
-  queries: ({}) => ({
+  queries: ({ postgis_geometry_field, latitude_field, longtitude_field }) => ({
     async get_rows_query(state, table_id) {
-      return await getRowsQueryImpl(state, table_id);
+      return await getRowsQueryImpl(
+        state,
+        table_id,
+        postgis_geometry_field,
+        latitude_field,
+        longtitude_field,
+      );
     },
   }),
   renderRows,

@@ -26,7 +26,13 @@ const configuration_workflow = () =>
             lat_long_options[table.name] = fields
               .filter((f) => f.type.name === "Float")
               .map((f) => f.name);
-            all_field_options[table.name] = fields.map((f) => f.name);
+            const geomTypeNames = new Set(["PostGIS Geometry", "PostGIS Geography"]);
+            const geomFields = fields.filter((f) => geomTypeNames.has(f.type?.name));
+            const otherFields = fields.filter((f) => !geomTypeNames.has(f.type?.name));
+            all_field_options[table.name] = [
+              ...geomFields.map((f) => ({ label: `${f.name} (${f.type.name})`, name: f.name })),
+              ...otherFields.map((f) => ({ label: f.name, name: f.name })),
+            ];
             const popup_views = await View.find_table_views_where(
               table.id,
               ({ viewtemplate }) => viewtemplate.runMany,

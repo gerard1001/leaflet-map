@@ -7,28 +7,64 @@ const ewkbToWKT = (hex) => {
     let p = 0;
     function readGeom() {
       const le = buf[p++] === 1;
-      const ru = () => { const v = le ? buf.readUInt32LE(p) : buf.readUInt32BE(p); p += 4; return v; };
-      const rd = () => { const v = le ? buf.readDoubleLE(p) : buf.readDoubleBE(p); p += 8; return v; };
+      const ru = () => {
+        const v = le ? buf.readUInt32LE(p) : buf.readUInt32BE(p);
+        p += 4;
+        return v;
+      };
+      const rd = () => {
+        const v = le ? buf.readDoubleLE(p) : buf.readDoubleBE(p);
+        p += 8;
+        return v;
+      };
       const typeVal = ru();
       const hasZ = !!(typeVal & 0x80000000);
       const hasSRID = !!(typeVal & 0x20000000);
-      const gt = typeVal & 0xFF;
+      const gt = typeVal & 0xff;
       if (hasSRID) ru();
-      const xy   = () => { const x = rd(), y = rd(); if (hasZ) rd(); return `${x} ${y}`; };
-      const ring = () => { const n = ru(); return `(${Array.from({length: n}, xy).join(", ")})`; };
-      const poly = () => { const n = ru(); return `(${Array.from({length: n}, ring).join(", ")})`; };
-      const subs = (n) => Array.from({length: n}, readGeom);
+      const xy = () => {
+        const x = rd(),
+          y = rd();
+        if (hasZ) rd();
+        return `${x} ${y}`;
+      };
+      const ring = () => {
+        const n = ru();
+        return `(${Array.from({ length: n }, xy).join(", ")})`;
+      };
+      const poly = () => {
+        const n = ru();
+        return `(${Array.from({ length: n }, ring).join(", ")})`;
+      };
+      const subs = (n) => Array.from({ length: n }, readGeom);
       if (gt === 1) return `POINT(${xy()})`;
-      if (gt === 2) { const n = ru(); return `LINESTRING(${Array.from({length: n}, xy).join(", ")})`; }
+      if (gt === 2) {
+        const n = ru();
+        return `LINESTRING(${Array.from({ length: n }, xy).join(", ")})`;
+      }
       if (gt === 3) return `POLYGON${poly()}`;
-      if (gt === 4) { const gs = subs(ru()); return `MULTIPOINT(${gs.map(g => g ? g.replace(/^POINT/, "") : "(0 0)").join(", ")})`; }
-      if (gt === 5) { const gs = subs(ru()); return `MULTILINESTRING(${gs.map(g => g ? g.replace(/^LINESTRING/, "") : "()").join(", ")})`; }
-      if (gt === 6) { const gs = subs(ru()); return `MULTIPOLYGON(${gs.map(g => g ? g.replace(/^POLYGON/, "") : "(())").join(", ")})`; }
-      if (gt === 7) { const gs = subs(ru()); return `GEOMETRYCOLLECTION(${gs.filter(Boolean).join(", ")})`; }
+      if (gt === 4) {
+        const gs = subs(ru());
+        return `MULTIPOINT(${gs.map((g) => (g ? g.replace(/^POINT/, "") : "(0 0)")).join(", ")})`;
+      }
+      if (gt === 5) {
+        const gs = subs(ru());
+        return `MULTILINESTRING(${gs.map((g) => (g ? g.replace(/^LINESTRING/, "") : "()")).join(", ")})`;
+      }
+      if (gt === 6) {
+        const gs = subs(ru());
+        return `MULTIPOLYGON(${gs.map((g) => (g ? g.replace(/^POLYGON/, "") : "(())")).join(", ")})`;
+      }
+      if (gt === 7) {
+        const gs = subs(ru());
+        return `GEOMETRYCOLLECTION(${gs.filter(Boolean).join(", ")})`;
+      }
       return null;
     }
     return readGeom();
-  } catch (e) { return null; }
+  } catch (e) {
+    return null;
+  }
 };
 
 const parseCoordPairs = (s) =>
@@ -105,7 +141,7 @@ const fetchGeoJSON = async (table, geomField, rowIds) => {
   try {
     const placeholders = rowIds.map((_, i) => `$${i + 1}`).join(", ");
     const res = await db.query(
-      `SELECT "${pk}", ST_AsGeoJSON("${geomField}") AS __geom
+      `SELECT "${pk}", "${geomField}" AS __geom
        FROM "${table.name}"
        WHERE "${pk}" IN (${placeholders})`,
       rowIds,
@@ -113,10 +149,15 @@ const fetchGeoJSON = async (table, geomField, rowIds) => {
     const result = {};
     for (const r of res.rows || []) {
       if (r.__geom == null) continue;
-      try {
-        const geojson = typeof r.__geom === "string" ? JSON.parse(r.__geom) : r.__geom;
-        if (geojson?.type) result[r[pk]] = geojson;
-      } catch {}
+      const raw = String(r.__geom).trim();
+      const wkt = /^(POINT|LINESTRING|POLYGON|MULTI|GEOMETRYCOLLECTION)/i.test(
+        raw,
+      )
+        ? raw
+        : ewkbToWKT(raw);
+      if (!wkt) continue;
+      const geojson = wktToGeoJSON(wkt);
+      if (geojson?.type) result[r[pk]] = geojson;
     }
     return result;
   } catch (e) {
@@ -153,7 +194,16 @@ const extractPointCoords = (geom) => {
   return null;
 };
 
-const radiusFilter = async (table, geomField, latField, lngField, rows, refLat, refLng, radiusKm) => {
+const radiusFilter = async (
+  table,
+  geomField,
+  latField,
+  lngField,
+  rows,
+  refLat,
+  refLng,
+  radiusKm,
+) => {
   if (!rows.length) return rows;
   const pk = table.pk_name || "id";
   const radiusM = radiusKm * 1000;
@@ -187,9 +237,12 @@ const radiusFilter = async (table, geomField, latField, lngField, rows, refLat, 
       const lat = parseFloat(row[latField]);
       const lng = parseFloat(row[lngField]);
       return (
-        !isNaN(lat) && !isNaN(lng) &&
-        lat >= refLat - dLat && lat <= refLat + dLat &&
-        lng >= refLng - dLng && lng <= refLng + dLng
+        !isNaN(lat) &&
+        !isNaN(lng) &&
+        lat >= refLat - dLat &&
+        lat <= refLat + dLat &&
+        lng >= refLng - dLng &&
+        lng <= refLng + dLng
       );
     });
   }
@@ -197,7 +250,17 @@ const radiusFilter = async (table, geomField, latField, lngField, rows, refLat, 
   return rows;
 };
 
-const bboxFilter = async (table, geomField, latField, lngField, rows, swLat, swLng, neLat, neLng) => {
+const bboxFilter = async (
+  table,
+  geomField,
+  latField,
+  lngField,
+  rows,
+  swLat,
+  swLng,
+  neLat,
+  neLng,
+) => {
   if (!rows.length) return rows;
   const pk = table.pk_name || "id";
 
@@ -227,9 +290,12 @@ const bboxFilter = async (table, geomField, latField, lngField, rows, swLat, swL
       const lat = parseFloat(row[latField]);
       const lng = parseFloat(row[lngField]);
       return (
-        !isNaN(lat) && !isNaN(lng) &&
-        lat >= swLat && lat <= neLat &&
-        lng >= swLng && lng <= neLng
+        !isNaN(lat) &&
+        !isNaN(lng) &&
+        lat >= swLat &&
+        lat <= neLat &&
+        lng >= swLng &&
+        lng <= neLng
       );
     });
   }
@@ -237,4 +303,11 @@ const bboxFilter = async (table, geomField, latField, lngField, rows, swLat, swL
   return rows;
 };
 
-module.exports = { wktToGeoJSON, ewkbToWKT, fetchGeoJSON, extractPointCoords, radiusFilter, bboxFilter };
+module.exports = {
+  wktToGeoJSON,
+  ewkbToWKT,
+  fetchGeoJSON,
+  extractPointCoords,
+  radiusFilter,
+  bboxFilter,
+};

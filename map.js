@@ -41,7 +41,17 @@ const configuration_workflow = () =>
                 sublabel:
                   "Optional: any field containing geometry (PostGIS column or WKT text). Supports Point, LineString, Polygon and Multi variants.",
                 required: false,
-                attributes: { options: fields.map((f) => f.name).join() },
+                attributes: {
+                  options: (() => {
+                    const geomTypeNames = new Set(["PostGIS Geometry", "PostGIS Geography"]);
+                    const geomFields = fields.filter((f) => geomTypeNames.has(f.type?.name));
+                    const otherFields = fields.filter((f) => !geomTypeNames.has(f.type?.name));
+                    return [
+                      ...geomFields.map((f) => ({ label: `${f.name} (${f.type.name})`, name: f.name })),
+                      ...otherFields.map((f) => ({ label: f.name, name: f.name })),
+                    ];
+                  })(),
+                },
               },
               {
                 name: "latitude_field",
